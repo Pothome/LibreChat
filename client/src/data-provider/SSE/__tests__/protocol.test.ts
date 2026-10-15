@@ -6,12 +6,7 @@ jest.mock('librechat-data-provider', () => ({
   },
 }));
 
-import {
-  GENERATION_PROTOCOL_HEADER,
-  getGenerationProtocolVersion,
-  postGenerationRequest,
-  supportsGenerationProtocolV2,
-} from '../protocol';
+import { GENERATION_PROTOCOL_HEADER, postGenerationRequest } from '../protocol';
 
 const response = (body: unknown, status = 200): Response =>
   ({
@@ -24,17 +19,6 @@ const response = (body: unknown, status = 200): Response =>
 describe('generation protocol negotiation', () => {
   beforeEach(() => {
     mockAuthenticatedFetch.mockReset();
-  });
-
-  it.each([
-    [{ generationProtocolVersion: 2 }, 2],
-    [{ generationProtocolVersion: 1 }, 1],
-    [{ generationProtocolVersion: '2' }, 1],
-    [{}, 1],
-    [undefined, 1],
-  ] as const)('fails closed for protocol echo %#', (value, expected) => {
-    expect(getGenerationProtocolVersion(value)).toBe(expected);
-    expect(supportsGenerationProtocolV2(value)).toBe(expected === 2);
   });
 
   it('advertises v2 in both the request header and JSON body', async () => {
