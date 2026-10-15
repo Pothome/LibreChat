@@ -16,3 +16,4 @@ export * from './patches';
 export * from './frames';
 export * from './sync';
 export * from './attach';
+export * from './launch';
