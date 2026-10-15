@@ -314,10 +314,8 @@ jest.mock('librechat-data-provider', () => {
   };
 });
 
-import useResumableSSE, {
-  selectLocalSteersForQueue,
-  ABORT_SWEEP_STATUSES,
-} from '~/hooks/SSE/useResumableSSE';
+import { selectLocalSteersForQueue, ABORT_SWEEP_STATUSES } from '~/hooks/SSE/useSteerChips';
+import useResumableSSE from '~/hooks/SSE/useResumableSSE';
 import useSSE from '~/hooks/SSE/useSSE';
 import {
   queuedMessagesByConvoId,
