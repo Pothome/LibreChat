@@ -4,3 +4,6 @@ export * from './events';
 export * from './resume';
 export * from './messages';
 export * from './protocol';
+export * from './run';
+export * from './host';
+export * from './subscription';

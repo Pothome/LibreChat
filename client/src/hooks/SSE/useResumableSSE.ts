@@ -9,7 +9,6 @@ import {
   ErrorTypes,
   StepEvents,
   StepTypes,
-  apiBaseUrl,
   SteerEvents,
   dataService,
   ContentTypes,
@@ -61,6 +60,9 @@ import {
   getStartGenerationConversationId,
   getPredecessorMismatchStartResponse,
   START_GENERATION_READINESS_TIMEOUT_MS,
+  ResumableRun,
+  documentVisibility,
+  ResumableSubscription,
 } from '@librechat/chat';
 import type {
   Agents,
@@ -79,9 +81,12 @@ import type {
   TAttachment,
   TTokenUsageEvent,
   TContextUsageEvent,
-  ChatStreamConnection,
 } from 'librechat-data-provider';
-import type { GenerationProtocolVersion, StartGenerationResult } from '@librechat/chat';
+import type {
+  SubscriptionTarget,
+  StartGenerationResult,
+  GenerationProtocolVersion,
+} from '@librechat/chat';
 import type { QueuedMessageOrigin, DrainAfterAbort, RunEnd } from '~/hooks/Chat/queue';
 import type { ActiveJobsResponse, StreamStatusResponse } from '~/data-provider';
 import type { EventHandlerParams } from './useEventHandlers';
@@ -127,7 +132,6 @@ import {
   useGetStartupConfig,
   queueTitleGeneration,
   streamStatusQueryKey,
-  generationProtocolHeaders,
   fetchConversationMessages,
 } from '~/data-provider';
 import {
@@ -262,6 +266,7 @@ export default function useResumableSSE(
   isAddedRequest = false,
   runIndex = 0,
 ) {
+  const [run] = useState(() => new ResumableRun());
   const jotaiStore = useStore();
   const localize = useLocalize();
   const queryClient = useQueryClient();
@@ -338,47 +343,6 @@ export default function useResumableSSE(
   const setSubmission = useSetRecoilState(store.submissionByIndex(runIndex));
   const setShowStopButton = useSetAtom(showStopButtonByIndex(runIndex));
   const setLiveAppliedSteerIds = useSetAtom(liveAppliedSteerIdsAtom);
-
-  const streamRef = useRef<AbortController | null>(null);
-  /** Removes the foreground re-attach listener owned by the newest
-   *  subscription; exactly one is registered at a time. */
-  const stopForegroundReattachRef = useRef<(() => void) | null>(null);
-  const reconnectAttemptRef = useRef(0);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const submissionRef = useRef<TSubmission | null>(null);
-  /** Suppresses the normal close/cleanup idle transition while a stale
-   * generation is being atomically handed off to its live replacement. */
-  const replacementHandoffRef = useRef(false);
-  const optimisticStreamIdsRef = useRef(new Set<string>());
-  const createdStreamIdsRef = useRef(new Set<string>());
-  /** Pending action whose tool-call content part hasn't rendered yet, retried
-   *  on the next frame so a fast pause-before-render race still attaches. */
-  const pendingActionRetryRef = useRef<number | null>(null);
-  /** EVERY steer retry frame, not only the newest one. Several steers can be
-   *  applied before their shared response placeholder renders; retaining one
-   *  handle let the older chains outlive navigation/terminal cleanup and
-   *  mutate a later generation that reused the same response id. */
-  const steerRetryFramesRef = useRef<Set<number>>(new Set());
-  /** EVERY outstanding label-retry frame, not a single handle: labels fire
-   *  two events per slot (reservation, then fill), so concurrent retry
-   *  chains are the norm: a single ref would let cleanup cancel only the
-   *  newest chain while the others kept running for up to 120 frames and
-   *  could apply a stale label to a replacement generation that reuses the
-   *  same response id (edits do). */
-  const activityLabelRetryFramesRef = useRef<Set<number>>(new Set());
-  /**
-   * Set once a SYNC has replaced the response with the server's
-   * completion-local snapshot, which discards the prefix an edited
-   * resubmission retained. From that point incoming indices are absolute and
-   * `editPrefixLength` must no longer be applied, by run steps or labels.
-   */
-  const editPrefixClearedRef = useRef(false);
-  const editPrefixFirstPartFoldedRef = useRef(false);
-  /** Generation the cleared-prefix state above belongs to, so it is dropped
-   *  when a new generation starts rather than when a subscribe happens to be
-   *  live. Keyed by response message id: the stream id is the conversation
-   *  id and is therefore shared by every generation within it. */
-  const prefixStateGenerationIdRef = useRef<string | null>(null);
 
   const restoreQueuedSubmission = useCallback(
     (failedSubmission: TSubmission, expectedPredecessorCreatedAt?: number) => {
@@ -579,7 +543,7 @@ export default function useResumableSSE(
                 ...(steer.clientSteerId && { clientSteerId: steer.clientSteerId }),
                 text: steer.text,
                 status: 'pending' as const,
-                createdAt: steer.createdAt ?? Date.now(),
+                createdAt: steer.createdAt ?? run.scheduler.now(),
                 ...(restoredFiles && restoredFiles.length > 0 && { files: restoredFiles }),
                 ...((keepLocalPreempt ? localChip?.preempt : steer.preempt) === true && {
                   preempt: true,
@@ -700,9 +664,6 @@ export default function useResumableSSE(
     [convertSteersToQueued],
   );
 
-  /** The generation epoch the pane's stream is attached to, kept so a run left mid-stream can
-   *  carry it. A server that reports no epoch leaves it unset. */
-  const subscribedEpochRef = useRef<number | null>(null);
   /** Conversation ids are reused by successive agent turns. Keep the exact
    * live epoch beside the UI controls, and only clear it if the terminal event
    * still belongs to the epoch that installed it. */
@@ -729,15 +690,9 @@ export default function useResumableSSE(
   );
 
   const publishRunEnd = useSetAtom(runEndByIndex(runIndex));
-  /** Whether the current submission's run end already reached the queue drain. A run that
-   *  ended attached must not also be resolved as detached when the user later leaves. */
-  const runEndPublishedRef = useRef(false);
-  /** Whether the server named the current submission's user message (`created`, or a resume's
-   *  sync). Only a run whose identity it confirmed is remembered when the user leaves. */
-  const identityConfirmedRef = useRef(false);
   const setRunEnd = useCallback(
     (end: RunEnd, options?: { retainDetached?: boolean }) => {
-      runEndPublishedRef.current = true;
+      run.runEndPublished = true;
       /** The run's end reached the drain here, so a marker this pane left for the same run is
        *  settled and must not be resolved a second time on a later visit. A provisional end that
        *  cannot drain the queue keeps the marker, so a later read of history can still settle it. */
@@ -754,7 +709,7 @@ export default function useResumableSSE(
       }
       publishRunEnd(end);
     },
-    [jotaiStore, publishRunEnd],
+    [jotaiStore, publishRunEnd, run],
   );
   const setDrainAfterAbort = useSetAtom(drainAfterAbortByIndex(runIndex));
   const clearDrainAfterAbort = useCallback(
@@ -809,15 +764,15 @@ export default function useResumableSSE(
    */
   const stepHandler = useCallback(
     (...[event, submission]: Parameters<typeof rawStepHandler>) => {
-      const eventSubmission = editPrefixClearedRef.current
+      const eventSubmission = run.editPrefixCleared
         ? ({ ...submission, editPrefixCleared: true } as EventSubmission)
         : submission;
       rawStepHandler(event, eventSubmission);
       if (eventSubmission.editPrefixFirstPartFolded === true) {
-        editPrefixFirstPartFoldedRef.current = true;
+        run.editPrefixFirstPartFolded = true;
       }
     },
-    [rawStepHandler],
+    [rawStepHandler, run],
   );
 
   const { data: startupConfig } = useGetStartupConfig();
@@ -842,25 +797,29 @@ export default function useResumableSSE(
    * @param isResume - If true, adds ?resume=true to trigger sync event from server
    */
   const subscribeToStream = useCallback(
-    (
-      currentStreamId: string,
-      currentSubmission: TSubmission,
-      isResume = false,
-      generationCreatedAt?: number,
-      generationProtocolVersion: GenerationProtocolVersion = 1,
-      lifecycleSignal?: AbortSignal,
-    ) => {
-      /** Every effect owns one AbortSignal, while every reconnect owns one SSE
-       * instance. Both identities matter: cleanup can close an attachment after
-       * its async listener has already crossed an `await`, and a reconnect can
-       * supersede an older attachment without changing the submission object.
-       * The captured submission check is the final fence against a later
-       * conversation installing its own submission in this pane. */
-      if (lifecycleSignal?.aborted || submissionRef.current !== currentSubmission) {
+    (target: SubscriptionTarget) => {
+      /** See `ResumableSubscription.isCurrent` for the fences every callback below checks. */
+      if (target.signal?.aborted || run.submission !== target.submission) {
         return;
       }
-      subscribedEpochRef.current = generationCreatedAt ?? null;
-      const startedAsNewConversation = optimisticStreamIdsRef.current.has(currentStreamId);
+      const sub = new ResumableSubscription(
+        run,
+        {
+          logger,
+          visibility: documentVisibility,
+          fetchStatus: fetchStreamStatus,
+          subscribe: (next) => subscribeToStream(next),
+        },
+        target,
+      );
+      const {
+        streamId: currentStreamId,
+        isResume,
+        generationCreatedAt,
+        generationProtocolVersion,
+        startedAsNewConversation,
+      } = sub;
+      run.subscribedEpoch = generationCreatedAt ?? null;
       /** Terminal handlers below are fenced by this subscription and its generation.
        * Clear every key the same run may have occupied, including the temporary
        * new-chat key, so aborts and resumes from another tab cannot leave a stale
@@ -869,8 +828,8 @@ export default function useResumableSSE(
         const conversationIds = new Set<string>([
           currentStreamId,
           ...(conversationId ? [conversationId] : []),
-          ...(currentSubmission.conversation?.conversationId
-            ? [currentSubmission.conversation.conversationId]
+          ...(sub.submission.conversation?.conversationId
+            ? [sub.submission.conversation.conversationId]
             : []),
           ...(startedAsNewConversation ? [String(Constants.NEW_CONVO)] : []),
         ]);
@@ -932,32 +891,18 @@ export default function useResumableSSE(
        * reconnects".
        */
       const generationId =
-        currentSubmission.clientRequestId ??
-        (currentSubmission.initialResponse as TMessage | undefined)?.messageId ??
+        sub.submission.clientRequestId ??
+        (sub.submission.initialResponse as TMessage | undefined)?.messageId ??
         currentStreamId;
-      if (prefixStateGenerationIdRef.current !== generationId) {
-        prefixStateGenerationIdRef.current = generationId;
-        editPrefixClearedRef.current = false;
-        editPrefixFirstPartFoldedRef.current = false;
-      }
-      bindResponse(currentSubmission);
-      let { userMessage } = currentSubmission;
-      let textIndex: number | null = null;
-      let finalReceived = false;
-      /** This subscription must never be revived. Set by the terminal
-       *  recoveries that do not ride a FINAL or served-error frame — the 404
-       *  and retry-ceiling reconciles both leave the attachment pointing at a
-       *  stream the server no longer has — and by the dev-only navigation
-       *  simulator below. `finalReceived` covers the frame-carried terminals. */
-      let subscriptionRetired = false;
-      const preCreatedStepEvents: StepEvent[] = [];
+      run.bindPrefixState(generationId);
+      bindResponse(sub.submission);
       const replayPreCreatedStepEvents = () => {
-        if (!isCurrentSubscription() || preCreatedStepEvents.length === 0) {
+        if (!sub.isCurrent() || sub.preCreatedStepEvents.length === 0) {
           return;
         }
 
-        const submission = { ...currentSubmission, userMessage } as EventSubmission;
-        for (const event of preCreatedStepEvents.splice(0)) {
+        const submission = sub.liveSubmission() as EventSubmission;
+        for (const event of sub.preCreatedStepEvents.splice(0)) {
           stepHandler(event, submission);
         }
       };
@@ -1025,25 +970,19 @@ export default function useResumableSSE(
       // load, so a single retry would drop a valid pause and leave the run with no
       // approval controls. Bounded so a genuinely-absent target can't spin forever.
       const PENDING_ACTION_MAX_RETRY_FRAMES = 120;
-      const cancelSteerRetryFrames = () => {
-        for (const frameId of steerRetryFramesRef.current) {
-          cancelAnimationFrame(frameId);
-        }
-        steerRetryFramesRef.current.clear();
-      };
       const applyPendingActionToMessages = (pendingAction: Agents.PendingAction, attempt = 0) => {
-        if (!isCurrentSubscription()) {
+        if (!sub.isCurrent()) {
           return;
         }
         const pendingConversationId =
           pendingAction.conversationId ??
-          currentSubmission.conversation?.conversationId ??
+          sub.submission.conversation?.conversationId ??
           currentStreamId;
         jotaiStore.set(pendingApprovalActionFamily(pendingConversationId), pendingAction);
         const retryNextFrame = () => {
           if (attempt < PENDING_ACTION_MAX_RETRY_FRAMES) {
-            pendingActionRetryRef.current = requestAnimationFrame(() => {
-              if (isCurrentSubscription()) {
+            run.pendingActionRetry = run.scheduler.requestFrame(() => {
+              if (sub.isCurrent()) {
                 applyPendingActionToMessages(pendingAction, attempt + 1);
               }
             });
@@ -1091,8 +1030,8 @@ export default function useResumableSSE(
        * of the live user message. Read at call time — `created` reassigns both.
        */
       const livePlaceholderIds = () => [
-        currentSubmission.initialResponse?.messageId,
-        userMessage?.messageId ? `${userMessage.messageId}_` : undefined,
+        sub.submission.initialResponse?.messageId,
+        sub.userMessage?.messageId ? `${sub.userMessage.messageId}_` : undefined,
       ];
 
       /**
@@ -1103,11 +1042,10 @@ export default function useResumableSSE(
        * handler receives in step with the placeholder this pane mutated.
        */
       const syncSubmissionPlaceholder = (updated: TMessage) => {
-        if (updated.messageId !== currentSubmission.initialResponse?.messageId) {
+        if (updated.messageId !== sub.submission.initialResponse?.messageId) {
           return;
         }
-        currentSubmission = { ...currentSubmission, initialResponse: updated };
-        submissionRef.current = currentSubmission;
+        sub.replaceSubmission({ ...sub.submission, initialResponse: updated });
       };
 
       /**
@@ -1119,9 +1057,9 @@ export default function useResumableSSE(
        * `initialResponse.content` with the server's completion-local snapshot.
        */
       const editPrefixLength = () =>
-        currentSubmission.editedContent != null && !editPrefixClearedRef.current
-          ? (currentSubmission.editPrefixLength ??
-            currentSubmission.initialResponse?.content?.length ??
+        sub.submission.editedContent != null && !run.editPrefixCleared
+          ? (sub.submission.editPrefixLength ??
+            sub.submission.initialResponse?.content?.length ??
             0)
           : 0;
 
@@ -1136,11 +1074,11 @@ export default function useResumableSSE(
         attempt = 0,
         liveSteerIds: string[] = [],
       ) => {
-        if (!isCurrentSubscription()) {
+        if (!sub.isCurrent()) {
           return;
         }
         const chipConvoId =
-          event.conversationId ?? currentSubmission.conversation?.conversationId ?? currentStreamId;
+          event.conversationId ?? sub.submission.conversation?.conversationId ?? currentStreamId;
         /** The server's applied event settles ownership immediately. Rendering
          *  the inline part can wait for React to mount the target, but leaving
          *  the chip pending during that wait lets an intervening error/final
@@ -1156,13 +1094,13 @@ export default function useResumableSSE(
             : liveSteerIds;
         const retryNextFrame = () => {
           if (attempt < PENDING_ACTION_MAX_RETRY_FRAMES) {
-            const frameId = requestAnimationFrame(() => {
-              steerRetryFramesRef.current.delete(frameId);
-              if (isCurrentSubscription()) {
+            const frameId = run.scheduler.requestFrame(() => {
+              run.steerRetryFrames.delete(frameId);
+              if (sub.isCurrent()) {
                 applySteerToMessages(event, attempt + 1, firstApplicationIds);
               }
             });
-            steerRetryFramesRef.current.add(frameId);
+            run.steerRetryFrames.add(frameId);
           }
         };
         /** Same boundary as pending actions: land queued deltas before the
@@ -1212,18 +1150,18 @@ export default function useResumableSSE(
        * bounded next-frame retry as steers for the inject-before-render race.
        */
       const applyActivityLabelToMessages = (event: TActivityLabelEvent, attempt = 0) => {
-        if (!isCurrentSubscription()) {
+        if (!sub.isCurrent()) {
           return;
         }
         const retryNextFrame = () => {
           if (attempt < PENDING_ACTION_MAX_RETRY_FRAMES) {
-            const frameId = requestAnimationFrame(() => {
-              activityLabelRetryFramesRef.current.delete(frameId);
-              if (isCurrentSubscription()) {
+            const frameId = run.scheduler.requestFrame(() => {
+              run.activityLabelRetryFrames.delete(frameId);
+              if (sub.isCurrent()) {
                 applyActivityLabelToMessages(event, attempt + 1);
               }
             });
-            activityLabelRetryFramesRef.current.add(frameId);
+            run.activityLabelRetryFrames.add(frameId);
           }
         };
         /** Same boundary as pending actions and steers: land queued deltas
@@ -1269,7 +1207,7 @@ export default function useResumableSSE(
             typeof phasePart.activity_start_index === 'number'
           ) {
             let activityStartIndex = phasePart.activity_start_index + prefixLength;
-            const foldedFirstPart = editPrefixFirstPartFoldedRef.current;
+            const foldedFirstPart = run.editPrefixFirstPartFolded;
             const targetContent = messages[index]?.content;
             /** The step handler records an actual server-index-zero text/think
              *  merge. An empty +prefix slot is insufficient evidence because
@@ -1312,18 +1250,18 @@ export default function useResumableSSE(
 
       /** Patches a generated title onto its existing reasoning part. */
       const applyReasoningLabelToMessages = (event: TReasoningLabelEvent, attempt = 0) => {
-        if (!isCurrentSubscription()) {
+        if (!sub.isCurrent()) {
           return;
         }
         const retryNextFrame = () => {
           if (attempt < PENDING_ACTION_MAX_RETRY_FRAMES) {
-            const frameId = requestAnimationFrame(() => {
-              activityLabelRetryFramesRef.current.delete(frameId);
-              if (isCurrentSubscription()) {
+            const frameId = run.scheduler.requestFrame(() => {
+              run.activityLabelRetryFrames.delete(frameId);
+              if (sub.isCurrent()) {
                 applyReasoningLabelToMessages(event, attempt + 1);
               }
             });
-            activityLabelRetryFramesRef.current.add(frameId);
+            run.activityLabelRetryFrames.add(frameId);
           }
         };
         flushPendingDeltas();
@@ -1338,7 +1276,7 @@ export default function useResumableSSE(
         if (
           prefixLength > 0 &&
           event.index === 0 &&
-          editPrefixFirstPartFoldedRef.current &&
+          run.editPrefixFirstPartFolded &&
           messages[messageIndex]?.content?.[contentIndex - 1]?.type === ContentTypes.THINK
         ) {
           contentIndex -= 1;
@@ -1360,134 +1298,12 @@ export default function useResumableSSE(
         syncStepMessage(updated);
       };
 
-      const baseUrl = `${apiBaseUrl()}/api/agents/chat/stream/${encodeURIComponent(currentStreamId)}`;
-      const query = new URLSearchParams();
-      if (isResume) {
-        query.set('resume', 'true');
-      }
-      if (generationCreatedAt != null) {
-        query.set('generationCreatedAt', String(generationCreatedAt));
-      }
-      query.set('generationProtocolVersion', String(GENERATION_PROTOCOL_VERSION));
-      const queryString = query.toString();
-      const url = queryString ? `${baseUrl}?${queryString}` : baseUrl;
-      logger.log('ResumableSSE', 'Subscribing to stream:', url, { isResume });
-
-      /** Closing is per connection: the transport tells this hook's own close
-       *  (`abort`) apart from a cancel by the user agent (`error` with status 0). */
-      const streamController = new AbortController();
-      streamRef.current = streamController;
-      let connection: ChatStreamConnection | null = null;
-      const isCurrentSubscription = () =>
-        lifecycleSignal?.aborted !== true &&
-        streamRef.current === streamController &&
-        submissionRef.current === currentSubmission;
-
-      const closeStream = () => streamController.abort();
-
-      let foregroundStatusCheckInFlight = false;
-      const reattachOnForeground = () => {
-        logger.log('ResumableSSE', 'Re-attaching stream on foreground');
-        /** Any backoff still pending targets this same attachment, so returning
-         *  to the app supersedes it rather than waiting the delay out; its
-         *  callback finds a superseded subscription and does nothing. */
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = null;
-        }
-        reconnectAttemptRef.current = Math.max(reconnectAttemptRef.current, 1);
-        closeStream();
-        subscribeToStream(
-          currentStreamId,
-          currentSubmission,
-          true,
-          generationCreatedAt,
-          generationProtocolVersion,
-          lifecycleSignal,
-        );
-      };
-
-      /**
-       * A suspended page can lose its stream without the transport ever
-       * reporting it. When a mobile browser freezes the tab, an intermediary
-       * closes the response body underneath it, and XHR surfaces that as an
-       * ordinary load — sse.js dispatches nothing for a body that simply ends,
-       * so neither the error nor the abort recovery above ever runs. Nothing
-       * else re-reads the conversation while the pane stays mounted, which is
-       * why the response the run finished writing only appears after a reload.
-       *
-       * Some mobile WebViews leave the XHR marked OPEN even after the suspended
-       * request stopped delivering events. In that case the durable run status
-       * is the only authority that distinguishes a healthy live attachment from
-       * a terminal one holding stale partial content. A terminal status forces
-       * the same resume path as a closed transport; it returns the synthesized
-       * terminal frame or 404 that reconciles persisted messages.
-       */
-      const handleForegroundReattach = () => {
-        if (
-          document.visibilityState !== 'visible' ||
-          finalReceived ||
-          subscriptionRetired ||
-          replacementHandoffRef.current ||
-          !isCurrentSubscription() ||
-          !submissionRef.current
-        ) {
-          return;
-        }
-
-        if (connection?.closed === true) {
-          reattachOnForeground();
-          return;
-        }
-
-        if (foregroundStatusCheckInFlight) {
-          return;
-        }
-        foregroundStatusCheckInFlight = true;
-        const foregroundConvoId = currentSubmission.conversation?.conversationId ?? currentStreamId;
-        void fetchStreamStatus(foregroundConvoId)
-          .then((status) => {
-            if (
-              status.active !== false ||
-              (status.createdAt != null &&
-                generationCreatedAt != null &&
-                status.createdAt !== generationCreatedAt) ||
-              !isCurrentSubscription() ||
-              finalReceived ||
-              subscriptionRetired ||
-              replacementHandoffRef.current ||
-              document.visibilityState !== 'visible'
-            ) {
-              return;
-            }
-            logger.log(
-              'ResumableSSE',
-              'Apparently open stream is terminal - reconciling on foreground',
-              { conversationId: foregroundConvoId, generationCreatedAt },
-            );
-            reattachOnForeground();
-          })
-          .catch((error) => {
-            if (!isCurrentSubscription()) {
-              return;
-            }
-            logger.warn('ResumableSSE', 'Could not verify stream on foreground', {
-              conversationId: foregroundConvoId,
-              generationCreatedAt,
-              error,
-            });
-          })
-          .finally(() => {
-            foregroundStatusCheckInFlight = false;
-          });
-      };
-      stopForegroundReattachRef.current?.();
-      document.addEventListener('visibilitychange', handleForegroundReattach);
-      stopForegroundReattachRef.current = () =>
-        document.removeEventListener('visibilitychange', handleForegroundReattach);
+      logger.log('ResumableSSE', 'Subscribing to stream:', sub.url(), { isResume });
+      sub.claim();
+      sub.watchForeground();
 
       const handleOpen = () => {
-        if (!isCurrentSubscription()) {
+        if (!sub.isCurrent()) {
           return;
         }
         logger.log('ResumableSSE', 'Stream connected');
@@ -1495,12 +1311,12 @@ export default function useResumableSSE(
         // Restore UI state on successful connection (including reconnection)
         setIsSubmitting(true);
         setShowStopButton(generationCreatedAt != null);
-        reconnectAttemptRef.current = 0;
+        run.reconnectAttempt = 0;
       };
 
       const handleFrame = async (event: ChatEvent) => {
         try {
-          if (!isCurrentSubscription() || finalReceived) {
+          if (!sub.isCurrent() || sub.finalReceived) {
             return;
           }
 
@@ -1516,43 +1332,37 @@ export default function useResumableSSE(
             // Synthesized lifecycle frames deliberately carry no ordinary
             // response payload. Reconcile durable history (or hand off to a
             // replacement epoch) instead of passing them to finalHandler.
-            finalReceived = true;
-            cancelSteerRetryFrames();
+            sub.finalReceived = true;
+            run.cancelSteerRetryFrames();
             void reconcileGenerationLifecycle(data);
             return;
           }
 
           if (event.type === 'final') {
             const { data } = event;
-            finalReceived = true;
+            sub.finalReceived = true;
             const finalConvoId =
               data.conversation?.conversationId ??
-              currentSubmission.conversation?.conversationId ??
+              sub.submission.conversation?.conversationId ??
               currentStreamId;
-            if (
-              !(await authorizeTerminalTeardown(finalConvoId, 'FINAL')) ||
-              !isCurrentSubscription()
-            ) {
+            if (!(await authorizeTerminalTeardown(finalConvoId, 'FINAL')) || !sub.isCurrent()) {
               return;
             }
-            cancelSteerRetryFrames();
-            if (reconnectTimeoutRef.current) {
-              clearTimeout(reconnectTimeoutRef.current);
-              reconnectTimeoutRef.current = null;
-            }
-            reconnectAttemptRef.current = 0;
+            run.cancelSteerRetryFrames();
+            run.clearReconnectTimeout();
+            run.reconnectAttempt = 0;
             logger.log('ResumableSSE', 'Received FINAL event', {
               aborted: data.aborted,
               conversationId: data.conversation?.conversationId,
               hasResponseMessage: !!data.responseMessage,
             });
             clearPendingApprovalForTerminal(finalConvoId);
-            clearComposerDrafts(runIndex, currentSubmission.conversation?.conversationId, {
+            clearComposerDrafts(runIndex, sub.submission.conversation?.conversationId, {
               includeNewChatDraft:
-                !currentSubmission.conversation?.conversationId ||
-                currentSubmission.conversation.conversationId === Constants.NEW_CONVO ||
-                optimisticStreamIdsRef.current.has(currentStreamId) ||
-                isInitialNewConversation(currentSubmission),
+                !sub.submission.conversation?.conversationId ||
+                sub.submission.conversation.conversationId === Constants.NEW_CONVO ||
+                run.optimisticStreamIds.has(currentStreamId) ||
+                isInitialNewConversation(sub.submission),
             });
             // A steer-applied event may still be waiting for its next-frame
             // message target when FINAL arrives. Reconcile directly from the
@@ -1593,9 +1403,9 @@ export default function useResumableSSE(
             convertLocalSteersToQueued(finalConvoId);
             let finalHandled = false;
             try {
-              finalHandler(data as TFinalResData, currentSubmission as EventSubmission);
+              finalHandler(data as TFinalResData, sub.submission as EventSubmission);
               finalHandled = true;
-              finalizeUsage(data, { ...currentSubmission, userMessage });
+              finalizeUsage(data, sub.liveSubmission());
             } catch (error) {
               logger.error('ResumableSSE', 'Error in finalHandler:', error);
               setIsSubmitting(false);
@@ -1609,7 +1419,7 @@ export default function useResumableSSE(
             const runEndTarget = resolveRunEndTarget({
               conversationId: finalConvoId,
               earlyAbort: data.earlyAbort === true,
-              startedAsNewConvo: optimisticStreamIdsRef.current.has(currentStreamId),
+              startedAsNewConvo: run.optimisticStreamIds.has(currentStreamId),
             });
             let finalOutcome: 'completed' | 'aborted' | 'error' = 'error';
             if (data.aborted === true || data.responseMessage?.unfinished === true) {
@@ -1624,7 +1434,7 @@ export default function useResumableSSE(
               // wasAbortedBeforeComplete branch); it must not auto-drain.
               outcome: finalOutcome,
               startedAsNewConvo: runEndTarget.startedAsNewConvo,
-              endedAt: Date.now(),
+              endedAt: run.scheduler.now(),
               generationCreatedAt,
               ...(data.responseMessage?.messageId != null && {
                 responseMessageId: data.responseMessage.messageId,
@@ -1636,10 +1446,9 @@ export default function useResumableSSE(
             removeActiveJob(currentStreamId);
             clearAttachedGenerationCreatedAt();
             (startupConfig?.balance?.enabled ?? false) && balanceQuery.refetch();
-            closeStream();
+            sub.close();
             setStreamId(null);
-            optimisticStreamIdsRef.current.delete(currentStreamId);
-            createdStreamIdsRef.current.delete(currentStreamId);
+            run.releaseStream(currentStreamId);
             return;
           }
 
@@ -1649,31 +1458,30 @@ export default function useResumableSSE(
               messageId: data.message?.messageId,
               conversationId: data.message?.conversationId,
             });
-            createdStreamIdsRef.current.add(currentStreamId);
+            run.createdStreamIds.add(currentStreamId);
             if (startedAsNewConversation) {
               updateActiveGenerationCreatedAt(Constants.NEW_CONVO, null, generationCreatedAt);
             }
             const runId = v4();
             setActiveRunId(runId);
-            userMessage = {
-              ...userMessage,
+            sub.userMessage = {
+              ...sub.userMessage,
               ...data.message,
-              overrideParentMessageId: userMessage.overrideParentMessageId,
+              overrideParentMessageId: sub.userMessage.overrideParentMessageId,
             };
             const createdInitialResponse = buildCreatedInitialResponse({
-              initialResponse: currentSubmission.initialResponse as TMessage,
-              userMessage,
-              isRegenerate: currentSubmission.isRegenerate,
+              initialResponse: sub.submission.initialResponse as TMessage,
+              userMessage: sub.userMessage,
+              isRegenerate: sub.submission.isRegenerate,
             });
-            currentSubmission = {
-              ...currentSubmission,
-              userMessage,
+            sub.replaceSubmission({
+              ...sub.submission,
+              userMessage: sub.userMessage,
               initialResponse: createdInitialResponse,
-            };
-            submissionRef.current = currentSubmission;
-            identityConfirmedRef.current = true;
-            bindResponse(currentSubmission);
-            createdHandler(data, currentSubmission as EventSubmission);
+            });
+            run.identityConfirmed = true;
+            bindResponse(sub.submission);
+            createdHandler(data, sub.submission as EventSubmission);
             replayPreCreatedStepEvents();
             return;
           }
@@ -1681,7 +1489,7 @@ export default function useResumableSSE(
           if (event.type === 'attachment' && event.data) {
             attachmentHandler({
               data: event.data as TAttachment,
-              submission: currentSubmission as EventSubmission,
+              submission: sub.submission as EventSubmission,
             });
             return;
           }
@@ -1692,12 +1500,12 @@ export default function useResumableSSE(
           }
 
           if (event.type === 'context_usage') {
-            contextHandler(event.data, { ...currentSubmission, userMessage });
+            contextHandler(event.data, sub.liveSubmission());
             return;
           }
 
           if (event.type === 'token_usage') {
-            usageHandler(event.data, { ...currentSubmission, userMessage });
+            usageHandler(event.data, sub.liveSubmission());
             return;
           }
 
@@ -1733,18 +1541,18 @@ export default function useResumableSSE(
               data.event === StepEvents.ON_MESSAGE_DELTA ||
               data.event === StepEvents.ON_REASONING_DELTA
             ) {
-              tapStream(data.data, { ...currentSubmission, userMessage });
+              tapStream(data.data, sub.liveSubmission());
             }
-            if (!isResume && !createdStreamIdsRef.current.has(currentStreamId)) {
+            if (!isResume && !run.createdStreamIds.has(currentStreamId)) {
               if (isOAuthStepEvent(data)) {
-                preCreatedStepEvents.push(data);
-                stepHandler(data, { ...currentSubmission, userMessage } as EventSubmission);
+                sub.preCreatedStepEvents.push(data);
+                stepHandler(data, sub.liveSubmission() as EventSubmission);
                 return;
               }
-              preCreatedStepEvents.push(data);
+              sub.preCreatedStepEvents.push(data);
               return;
             }
-            stepHandler(data, { ...currentSubmission, userMessage } as EventSubmission);
+            stepHandler(data, sub.liveSubmission() as EventSubmission);
             return;
           }
 
@@ -1759,24 +1567,23 @@ export default function useResumableSSE(
             setActiveRunId(runId);
             /** Keep the current run's preliminary id long enough to replace that optimistic
              *  row in place if this snapshot assigns its durable response id. */
-            const preliminaryResponseMessageId = currentSubmission.initialResponse?.messageId;
-            const currentUserMessageId = currentSubmission.userMessage?.messageId;
+            const preliminaryResponseMessageId = sub.submission.initialResponse?.messageId;
+            const currentUserMessageId = sub.submission.userMessage?.messageId;
             const preliminaryUserMessageId =
               currentUserMessageId &&
-              (currentSubmission.initialResponse?.parentMessageId === currentUserMessageId ||
+              (sub.submission.initialResponse?.parentMessageId === currentUserMessageId ||
                 preliminaryResponseMessageId === `${currentUserMessageId}_`)
                 ? currentUserMessageId
                 : undefined;
             const resumeSubmission = buildResumeEventSubmission(
-              currentSubmission,
-              userMessage,
+              sub.submission,
+              sub.userMessage,
               data.resumeState,
             );
-            currentSubmission = resumeSubmission;
-            submissionRef.current = resumeSubmission;
-            userMessage = resumeSubmission.userMessage;
+            sub.replaceSubmission(resumeSubmission);
+            sub.userMessage = resumeSubmission.userMessage;
             if (data.resumeState?.userMessage != null) {
-              identityConfirmedRef.current = true;
+              run.identityConfirmed = true;
             }
             /**
              * Totals rebuild from the persisted backfill at sync. Replayed or
@@ -1817,9 +1624,9 @@ export default function useResumableSSE(
               }
             }
 
-            if (data.resumeState?.aggregatedContent && userMessage?.messageId) {
+            if (data.resumeState?.aggregatedContent && sub.userMessage?.messageId) {
               const messages = getMessages() ?? [];
-              const userMsgId = userMessage.messageId;
+              const userMsgId = sub.userMessage.messageId;
               const hasResumedContent = data.resumeState.aggregatedContent.length > 0;
               const responseId = resumeSubmission.initialResponse.messageId;
               const messageIndexes = getResumeMessageIndexes(
@@ -1862,7 +1669,7 @@ export default function useResumableSSE(
                  * it the offset. Run steps and labels both read this.
                  */
                 if (!preserveLoadedContent) {
-                  editPrefixClearedRef.current = true;
+                  run.editPrefixCleared = true;
                 }
                 const responseMessage = {
                   ...resumeSubmission.initialResponse,
@@ -1882,7 +1689,7 @@ export default function useResumableSSE(
                 } as TMessage;
                 const updated = mergeResumeMessages(
                   messages,
-                  userMessage,
+                  sub.userMessage,
                   responseMessage,
                   messageIndexes,
                   resumeSubmission.compact === true,
@@ -1904,7 +1711,7 @@ export default function useResumableSSE(
                  *  later steps and labels must stop offsetting. Setting it
                  *  only in the matched branch left this path adding an offset
                  *  to indices that were already absolute. */
-                editPrefixClearedRef.current = true;
+                run.editPrefixCleared = true;
                 const newMessage = {
                   ...resumeSubmission.initialResponse,
                   messageId: responseId,
@@ -1915,7 +1722,7 @@ export default function useResumableSSE(
                 setMessages(
                   mergeResumeMessages(
                     messages,
-                    userMessage,
+                    sub.userMessage,
                     newMessage,
                     messageIndexes,
                     resumeSubmission.compact === true,
@@ -1948,7 +1755,7 @@ export default function useResumableSSE(
             // applied while this client was disconnected is absent here (its
             // inline part rides aggregatedContent instead), so an EMPTY list
             // must clear stale local pending chips, not leave them stranded.
-            const steerConvoId = currentSubmission.conversation?.conversationId ?? currentStreamId;
+            const steerConvoId = sub.submission.conversation?.conversationId ?? currentStreamId;
             seedSteerChips(
               steerConvoId,
               (data.resumeState?.pendingSteers ?? []) as TPendingSteer[],
@@ -2076,11 +1883,11 @@ export default function useResumableSSE(
             const { data } = event;
             const { index } = data;
             const text = 'text' in data ? data.text : undefined;
-            if (text != null && index !== textIndex) {
-              textIndex = index;
+            if (text != null && index !== sub.textIndex) {
+              sub.textIndex = index;
             }
-            tapContent(text, { ...currentSubmission, userMessage });
-            contentHandler({ data, submission: currentSubmission as EventSubmission });
+            tapContent(text, sub.liveSubmission());
+            contentHandler({ data, submission: sub.submission as EventSubmission });
             return;
           }
 
@@ -2088,15 +1895,18 @@ export default function useResumableSSE(
             const { data } = event;
             const text = data.text ?? data.response;
             const initialResponse = {
-              ...(currentSubmission.initialResponse as TMessage),
+              ...(sub.submission.initialResponse as TMessage),
               parentMessageId: data.parentMessageId,
               messageId: data.messageId,
             } as TMessage;
             /** Legacy non-agent streams send cumulative text here; feed the
              *  live estimate like the content path above */
-            const textSubmission = { ...currentSubmission, userMessage, initialResponse };
-            currentSubmission = textSubmission;
-            submissionRef.current = textSubmission;
+            const textSubmission = {
+              ...sub.submission,
+              userMessage: sub.userMessage,
+              initialResponse,
+            };
+            sub.replaceSubmission(textSubmission);
             tapContent(text, textSubmission);
             messageHandler(text, textSubmission);
           }
@@ -2109,7 +1919,7 @@ export default function useResumableSSE(
         conversationId: string,
         knownStatus?: Awaited<ReturnType<typeof fetchStreamStatus>>,
       ): Promise<boolean> {
-        if (!isCurrentSubscription() || generationProtocolVersion !== GENERATION_PROTOCOL_VERSION) {
+        if (!sub.isCurrent() || generationProtocolVersion !== GENERATION_PROTOCOL_VERSION) {
           return false;
         }
         let replacementStatus = knownStatus;
@@ -2118,11 +1928,11 @@ export default function useResumableSSE(
             // Deliberately unfenced: this read discovers the newer generation
             // after the epoch-fenced SSE endpoint rejects the stale attachment.
             replacementStatus = await fetchStreamStatus(conversationId);
-            if (!isCurrentSubscription()) {
+            if (!sub.isCurrent()) {
               return false;
             }
           } catch (error) {
-            if (!isCurrentSubscription()) {
+            if (!sub.isCurrent()) {
               return false;
             }
             logger.warn('ResumableSSE', 'Could not inspect replacement generation', {
@@ -2149,13 +1959,10 @@ export default function useResumableSSE(
           staleCreatedAt: generationCreatedAt,
           replacementCreatedAt: replacementStatus.createdAt,
         });
-        replacementHandoffRef.current = true;
-        cancelSteerRetryFrames();
-        closeStream();
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = null;
-        }
+        run.replacementHandoff = true;
+        run.cancelSteerRetryFrames();
+        sub.close();
+        run.clearReconnectTimeout();
         queryClient.setQueryData(streamStatusQueryKey(conversationId), {
           ...replacementStatus,
           generationHandoff: true,
@@ -2191,10 +1998,10 @@ export default function useResumableSSE(
               replacementStatus.resumeState?.pendingAction) as Agents.PendingAction,
           );
         }
-        resetLive({ ...currentSubmission, userMessage });
+        resetLive(sub.liveSubmission());
         clearStepMaps();
-        reconnectAttemptRef.current = 0;
-        submissionRef.current = null;
+        run.reconnectAttempt = 0;
+        run.submission = null;
         setIsSubmitting(true);
         setShowStopButton(true);
         setSubmission(null);
@@ -2208,38 +2015,27 @@ export default function useResumableSSE(
        * epoch can still be active despite a racing FINAL/error frame.
        */
       function retryFencedTerminalAttachment(reason: string): void {
-        if (!isCurrentSubscription()) {
+        if (!sub.isCurrent()) {
           return;
         }
         logger.warn('ResumableSSE', 'Deferring terminal teardown and retrying fenced attachment', {
-          conversationId: currentSubmission.conversation?.conversationId ?? currentStreamId,
+          conversationId: sub.submission.conversation?.conversationId ?? currentStreamId,
           generationCreatedAt,
           reason,
         });
-        reconnectAttemptRef.current = Math.max(reconnectAttemptRef.current, 1);
-        closeStream();
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
+        run.reconnectAttempt = Math.max(run.reconnectAttempt, 1);
+        sub.close();
+        if (run.reconnectTimeout) {
+          run.scheduler.clearTimeout(run.reconnectTimeout);
         }
-        reconnectTimeoutRef.current = setTimeout(() => {
-          if (isCurrentSubscription() && submissionRef.current) {
-            subscribeToStream(
-              currentStreamId,
-              submissionRef.current,
-              true,
-              generationCreatedAt,
-              generationProtocolVersion,
-              lifecycleSignal,
-            );
-          }
-        }, 250);
+        sub.scheduleReattach(250);
       }
 
       async function authorizeTerminalTeardown(
         conversationId: string,
         terminalKind: 'FINAL' | 'error',
       ): Promise<boolean> {
-        if (!isCurrentSubscription()) {
+        if (!sub.isCurrent()) {
           return false;
         }
         if (generationProtocolVersion !== GENERATION_PROTOCOL_VERSION) {
@@ -2249,11 +2045,11 @@ export default function useResumableSSE(
         let status: Awaited<ReturnType<typeof fetchStreamStatus>>;
         try {
           status = await fetchStreamStatus(conversationId);
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return false;
           }
         } catch (error) {
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return false;
           }
           logger.warn('ResumableSSE', `Could not verify ${terminalKind} generation status`, {
@@ -2276,7 +2072,7 @@ export default function useResumableSSE(
             generationCreatedAt != null &&
             status.createdAt !== generationCreatedAt &&
             (await handoffToReplacement(conversationId, status));
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return false;
           }
           if (handedOff) {
@@ -2304,12 +2100,12 @@ export default function useResumableSSE(
           'reconcileReason' | 'terminalStatus' | 'generationCreatedAt' | 'conversation'
         >,
       ): Promise<void> => {
-        if (!isCurrentSubscription()) {
+        if (!sub.isCurrent()) {
           return;
         }
         const reconciliationConvoId =
           event.conversation?.conversationId ??
-          currentSubmission.conversation?.conversationId ??
+          sub.submission.conversation?.conversationId ??
           currentStreamId;
         if (
           generationCreatedAt != null &&
@@ -2321,7 +2117,7 @@ export default function useResumableSSE(
 
         if (event.reconcileReason === 'generation_replaced') {
           const handedOff = await handoffToReplacement(reconciliationConvoId);
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
           if (handedOff) {
@@ -2330,25 +2126,14 @@ export default function useResumableSSE(
           // Replacement visibility can lag its notification by a round trip.
           // Retry the stale epoch; the fenced HTTP endpoint will return the
           // dedicated replacement response as soon as the new job is visible.
-          reconnectAttemptRef.current = Math.max(reconnectAttemptRef.current, 1);
-          closeStream();
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (isCurrentSubscription() && submissionRef.current) {
-              subscribeToStream(
-                currentStreamId,
-                submissionRef.current,
-                true,
-                generationCreatedAt,
-                generationProtocolVersion,
-                lifecycleSignal,
-              );
-            }
-          }, 250);
+          run.reconnectAttempt = Math.max(run.reconnectAttempt, 1);
+          sub.close();
+          sub.scheduleReattach(250);
           return;
         }
 
-        reconnectAttemptRef.current = Math.max(reconnectAttemptRef.current, 1);
-        closeStream();
+        run.reconnectAttempt = Math.max(run.reconnectAttempt, 1);
+        sub.close();
         clearStepMaps();
         let persistedMessages: TMessage[] | undefined;
         const messageQueryKey = [QueryKeys.messages, reconciliationConvoId] as const;
@@ -2362,20 +2147,20 @@ export default function useResumableSSE(
             queryKey: messageQueryKey,
             refetchType: 'none',
           });
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
           const fetched = await queryClient.fetchQuery<TMessage[]>({
             queryKey: messageQueryKey,
           });
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
           if (Array.isArray(fetched)) {
             persistedMessages = fetched;
           }
         } catch (error) {
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
           logger.warn('ResumableSSE', 'Could not refetch synthesized terminal state', {
@@ -2388,19 +2173,19 @@ export default function useResumableSSE(
             queryKey: [QueryKeys.conversation, reconciliationConvoId],
             refetchType: 'all',
           });
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
           await invalidateConversationLists(queryClient);
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
           await queryClient.invalidateQueries({ queryKey: [QueryKeys.pinnedConversations] });
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
         } catch (error) {
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
           logger.warn('ResumableSSE', 'Could not refresh synthesized conversation metadata', {
@@ -2412,11 +2197,11 @@ export default function useResumableSSE(
         let status: Awaited<ReturnType<typeof fetchStreamStatus>> | undefined;
         try {
           status = await fetchStreamStatus(reconciliationConvoId);
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
         } catch (error) {
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
           logger.warn('ResumableSSE', 'Could not inspect synthesized terminal status', {
@@ -2428,18 +2213,7 @@ export default function useResumableSSE(
           /** A v2 control frame cannot be reconciled with a legacy status
            * snapshot (for example during a rolling deploy). Preserve the
            * attachment and retry the exact fenced generation. */
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (isCurrentSubscription() && submissionRef.current) {
-              subscribeToStream(
-                currentStreamId,
-                submissionRef.current,
-                true,
-                generationCreatedAt,
-                generationProtocolVersion,
-                lifecycleSignal,
-              );
-            }
-          }, 250);
+          sub.scheduleReattach(250);
           return;
         }
         if (
@@ -2448,7 +2222,7 @@ export default function useResumableSSE(
           (generationCreatedAt == null || status.createdAt !== generationCreatedAt)
         ) {
           const handedOff = await handoffToReplacement(reconciliationConvoId, status);
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
           if (handedOff) {
@@ -2461,18 +2235,7 @@ export default function useResumableSSE(
         ) {
           // Durable state still calls this exact epoch active. Prefer another
           // fenced resume over terminalizing on a racing synthesized frame.
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (isCurrentSubscription() && submissionRef.current) {
-              subscribeToStream(
-                currentStreamId,
-                submissionRef.current,
-                true,
-                generationCreatedAt,
-                generationProtocolVersion,
-                lifecycleSignal,
-              );
-            }
-          }, 250);
+          sub.scheduleReattach(250);
           return;
         }
 
@@ -2484,7 +2247,7 @@ export default function useResumableSSE(
         settleAppliedSteerParts(reconciliationConvoId, authoritativeValues);
         const unrecovered = status?.unrecoveredSteers ?? [];
         if (unrecovered.length > 0) {
-          const recoverySteerId = getRecoverySteerId(currentSubmission);
+          const recoverySteerId = getRecoverySteerId(sub.submission);
           convertSteersToQueued(reconciliationConvoId, unrecovered, {
             ...(recoverySteerId != null && {
               allowPreviouslyConvertedIds: [recoverySteerId],
@@ -2504,7 +2267,7 @@ export default function useResumableSSE(
           });
         }
 
-        resetLive({ ...currentSubmission, userMessage });
+        resetLive(sub.liveSubmission());
         removeActiveJob(currentStreamId);
         clearAttachedGenerationCreatedAt();
         clearPendingApprovalForTerminal(reconciliationConvoId);
@@ -2512,8 +2275,8 @@ export default function useResumableSSE(
           includeNewChatDraft:
             !reconciliationConvoId ||
             reconciliationConvoId === Constants.NEW_CONVO ||
-            optimisticStreamIdsRef.current.has(currentStreamId) ||
-            isInitialNewConversation(currentSubmission),
+            run.optimisticStreamIds.has(currentStreamId) ||
+            isInitialNewConversation(sub.submission),
         });
         setIsSubmitting(false);
         setShowStopButton(false);
@@ -2523,7 +2286,7 @@ export default function useResumableSSE(
            * unknown, so consume that override before publishing runEnd; the
            * queued words remain available for a deliberate retry. */
           clearDrainAfterAbort(
-            currentSubmission.conversation?.conversationId || String(Constants.NEW_CONVO),
+            sub.submission.conversation?.conversationId || String(Constants.NEW_CONVO),
             generationCreatedAt,
           );
         }
@@ -2537,15 +2300,14 @@ export default function useResumableSSE(
           reconciliationOutcome === 'completed'
             ? completedResponseMessageId(
                 persistedMessages,
-                userMessage?.messageId,
-                status?.resumeState?.responseMessageId ??
-                  currentSubmission.initialResponse?.messageId,
+                sub.userMessage?.messageId,
+                status?.resumeState?.responseMessageId ?? sub.submission.initialResponse?.messageId,
               )
             : undefined;
         setRunEnd({
           conversationId: reconciliationConvoId,
           outcome: reconciliationOutcome,
-          endedAt: Date.now(),
+          endedAt: run.scheduler.now(),
           generationCreatedAt: status?.createdAt ?? generationCreatedAt,
           ...(reconciledResponseMessageId != null && {
             responseMessageId: reconciledResponseMessageId,
@@ -2553,9 +2315,8 @@ export default function useResumableSSE(
         });
         setSubmission(null);
         setStreamId(null);
-        optimisticStreamIdsRef.current.delete(currentStreamId);
-        createdStreamIdsRef.current.delete(currentStreamId);
-        reconnectAttemptRef.current = 0;
+        run.releaseStream(currentStreamId);
+        run.reconnectAttempt = 0;
       };
 
       /**
@@ -2570,11 +2331,11 @@ export default function useResumableSSE(
         status: responseCode,
         data,
       }: Pick<Extract<ChatEvent, { type: 'error' }>, 'status' | 'data'>) => {
-        if (!isCurrentSubscription()) {
+        if (!sub.isCurrent()) {
           return;
         }
 
-        if (finalReceived) {
+        if (sub.finalReceived) {
           logger.log('ResumableSSE', 'Ignoring error after FINAL event', {
             responseCode,
             hasData: data != null,
@@ -2585,10 +2346,9 @@ export default function useResumableSSE(
         (startupConfig?.balance?.enabled ?? false) && balanceQuery.refetch();
 
         if (responseCode === 409) {
-          const replacementConvoId =
-            currentSubmission.conversation?.conversationId ?? currentStreamId;
+          const replacementConvoId = sub.submission.conversation?.conversationId ?? currentStreamId;
           const handedOff = await handoffToReplacement(replacementConvoId);
-          if (!isCurrentSubscription()) {
+          if (!sub.isCurrent()) {
             return;
           }
           if (handedOff) {
@@ -2600,22 +2360,22 @@ export default function useResumableSSE(
         // Refetch and reconcile them before recovering local steers: the final
         // response may contain an applied steer whose live event was missed.
         if (responseCode === 404) {
-          const convoId = currentSubmission.conversation?.conversationId;
+          const convoId = sub.submission.conversation?.conversationId;
           logger.log('ResumableSSE', 'Stream 404, invalidating messages for:', convoId);
           // Keep the UI non-idle while the status read decides whether this is
           // terminal cleanup or a handoff to a newer generation epoch.
-          reconnectAttemptRef.current = Math.max(reconnectAttemptRef.current, 1);
-          cancelSteerRetryFrames();
-          closeStream();
+          run.reconnectAttempt = Math.max(run.reconnectAttempt, 1);
+          run.cancelSteerRetryFrames();
+          sub.close();
           /** Terminal: drop any in-flight live estimate so the gauge doesn't
            *  keep counting stale streamed output after the stream ends */
-          resetLive({ ...currentSubmission, userMessage });
+          resetLive(sub.liveSubmission());
           clearComposerDrafts(runIndex, convoId, {
             includeNewChatDraft:
               !convoId ||
               convoId === Constants.NEW_CONVO ||
-              optimisticStreamIdsRef.current.has(currentStreamId) ||
-              isInitialNewConversation(currentSubmission),
+              run.optimisticStreamIds.has(currentStreamId) ||
+              isInitialNewConversation(sub.submission),
           });
           clearStepMaps();
           let persistedMessages: TMessage[] | undefined;
@@ -2626,7 +2386,7 @@ export default function useResumableSSE(
                 queryKey: messageQueryKey,
                 refetchType: 'none',
               });
-              if (!isCurrentSubscription()) {
+              if (!sub.isCurrent()) {
                 return;
               }
               const fetched = await queryClient.fetchQuery<TMessage[]>({
@@ -2634,14 +2394,14 @@ export default function useResumableSSE(
                 // The first stream can finish before CREATED mounts the saved-chat query.
                 queryFn: () => fetchConversationMessages(convoId),
               });
-              if (!isCurrentSubscription()) {
+              if (!sub.isCurrent()) {
                 return;
               }
               if (Array.isArray(fetched)) {
                 persistedMessages = fetched;
               }
             } catch (error) {
-              if (!isCurrentSubscription()) {
+              if (!sub.isCurrent()) {
                 return;
               }
               logger.warn('ResumableSSE', 'Could not reconcile persisted messages after 404', {
@@ -2665,25 +2425,14 @@ export default function useResumableSSE(
           let confirmedV2Terminal = false;
           try {
             const status = await fetchStreamStatus(recoveryConvoId);
-            if (!isCurrentSubscription()) {
+            if (!sub.isCurrent()) {
               return;
             }
             if (
               generationProtocolVersion === GENERATION_PROTOCOL_VERSION &&
               !supportsGenerationProtocolV2(status)
             ) {
-              reconnectTimeoutRef.current = setTimeout(() => {
-                if (isCurrentSubscription() && submissionRef.current) {
-                  subscribeToStream(
-                    currentStreamId,
-                    submissionRef.current,
-                    true,
-                    generationCreatedAt,
-                    generationProtocolVersion,
-                    lifecycleSignal,
-                  );
-                }
-              }, 1_000);
+              sub.scheduleReattach(1_000);
               return;
             }
             if (
@@ -2692,7 +2441,7 @@ export default function useResumableSSE(
               (generationCreatedAt == null || status.createdAt !== generationCreatedAt)
             ) {
               const handedOff = await handoffToReplacement(recoveryConvoId, status);
-              if (!isCurrentSubscription()) {
+              if (!sub.isCurrent()) {
                 return;
               }
               if (handedOff) {
@@ -2700,18 +2449,7 @@ export default function useResumableSSE(
               }
               /** Legacy generations have no replacement-handoff contract.
                * Never attach this submission to a different epoch. */
-              reconnectTimeoutRef.current = setTimeout(() => {
-                if (isCurrentSubscription() && submissionRef.current) {
-                  subscribeToStream(
-                    currentStreamId,
-                    submissionRef.current,
-                    true,
-                    generationCreatedAt,
-                    generationProtocolVersion,
-                    lifecycleSignal,
-                  );
-                }
-              }, 1_000);
+              sub.scheduleReattach(1_000);
               return;
             }
             if (status.active === true) {
@@ -2749,19 +2487,8 @@ export default function useResumableSSE(
               }
               setIsSubmitting(true);
               setShowStopButton(status.createdAt != null);
-              reconnectAttemptRef.current = Math.max(reconnectAttemptRef.current, 1);
-              reconnectTimeoutRef.current = setTimeout(() => {
-                if (isCurrentSubscription() && submissionRef.current) {
-                  subscribeToStream(
-                    activeStreamId,
-                    submissionRef.current,
-                    true,
-                    status.createdAt,
-                    generationProtocolVersion,
-                    lifecycleSignal,
-                  );
-                }
-              }, 1_000);
+              run.reconnectAttempt = Math.max(run.reconnectAttempt, 1);
+              sub.scheduleReattach(1_000, activeStreamId, status.createdAt);
               return;
             }
             confirmedV2Terminal =
@@ -2770,7 +2497,7 @@ export default function useResumableSSE(
             const canRecoverTerminalSteers = generationProtocolVersion === 1 || confirmedV2Terminal;
             const unrecovered = canRecoverTerminalSteers ? (status.unrecoveredSteers ?? []) : [];
             if (unrecovered.length > 0) {
-              const recoverySteerId = getRecoverySteerId(currentSubmission);
+              const recoverySteerId = getRecoverySteerId(sub.submission);
               convertSteersToQueued(recoveryConvoId, unrecovered, {
                 generationProtocolVersion,
                 ...(recoverySteerId != null && {
@@ -2785,7 +2512,7 @@ export default function useResumableSSE(
               }
             }
           } catch (error) {
-            if (!isCurrentSubscription()) {
+            if (!sub.isCurrent()) {
               return;
             }
             logger.warn('ResumableSSE', 'Could not recover parked steers after 404', {
@@ -2798,8 +2525,8 @@ export default function useResumableSSE(
           clearAttachedGenerationCreatedAt();
           clearPendingApprovalForTerminal(recoveryConvoId);
           if (
-            !createdStreamIdsRef.current.has(currentStreamId) &&
-            optimisticStreamIdsRef.current.has(currentStreamId)
+            !run.createdStreamIds.has(currentStreamId) &&
+            run.optimisticStreamIds.has(currentStreamId)
           ) {
             // Both fresh and resumed subscriptions can miss every event of a fast turn.
             // A missing job proves neither that the conversation was saved nor that it failed.
@@ -2807,7 +2534,7 @@ export default function useResumableSSE(
               const persisted = await fetchConvoSnapshot(queryClient, recoveryConvoId, () =>
                 dataService.getConversationById(recoveryConvoId),
               );
-              if (!isCurrentSubscription()) return;
+              if (!sub.isCurrent()) return;
               if (persisted?.conversationId === recoveryConvoId) {
                 queryClient.setQueryData([QueryKeys.conversation, recoveryConvoId], persisted);
                 upsertConvoInAllQueries(queryClient, persisted, true, 'snapshot');
@@ -2828,7 +2555,7 @@ export default function useResumableSSE(
                 }
               }
             } catch (error) {
-              if (!isCurrentSubscription()) return;
+              if (!sub.isCurrent()) return;
               if (toStartGenerationError(error)?.response?.status === 404) {
                 removeConvoFromAllQueries(queryClient, currentStreamId);
               }
@@ -2840,7 +2567,7 @@ export default function useResumableSSE(
           if (persistedMessages) {
             setMessages(persistedMessages);
           }
-          subscriptionRetired = true;
+          sub.retired = true;
           setIsSubmitting(false);
           setShowStopButton(false);
 
@@ -2875,9 +2602,9 @@ export default function useResumableSSE(
             {
               conversationId: recoveryConvoId,
               outcome: 'aborted',
-              endedAt: Date.now(),
+              endedAt: run.scheduler.now(),
               ...detachedEnd,
-              startedAsNewConvo: optimisticStreamIdsRef.current.has(currentStreamId),
+              startedAsNewConvo: run.optimisticStreamIds.has(currentStreamId),
             },
             {
               retainDetached:
@@ -2885,9 +2612,8 @@ export default function useResumableSSE(
             },
           );
           setStreamId(null);
-          optimisticStreamIdsRef.current.delete(currentStreamId);
-          createdStreamIdsRef.current.delete(currentStreamId);
-          reconnectAttemptRef.current = 0;
+          run.releaseStream(currentStreamId);
+          run.reconnectAttempt = 0;
           return;
         }
 
@@ -2899,17 +2625,14 @@ export default function useResumableSSE(
          * not a server-sent error payload. Use `== null` to only match undefined/null (no HTTP status).
          */
         if (responseCode == null && data != null) {
-          finalReceived = true;
-          const recoveryConvoId = currentSubmission.conversation?.conversationId ?? currentStreamId;
-          if (
-            !(await authorizeTerminalTeardown(recoveryConvoId, 'error')) ||
-            !isCurrentSubscription()
-          ) {
+          sub.finalReceived = true;
+          const recoveryConvoId = sub.submission.conversation?.conversationId ?? currentStreamId;
+          if (!(await authorizeTerminalTeardown(recoveryConvoId, 'error')) || !sub.isCurrent()) {
             return;
           }
           logger.log('ResumableSSE', 'Server-sent error event received:', data);
-          cancelSteerRetryFrames();
-          closeStream();
+          run.cancelSteerRetryFrames();
+          sub.close();
           /** FLUSH (not cancel): the error card below is built from the cache
            * tail, so queued tokens must land first, and a stale trailing
            * frame must never overwrite the error write. */
@@ -2917,10 +2640,10 @@ export default function useResumableSSE(
           removeActiveJob(currentStreamId);
           clearAttachedGenerationCreatedAt();
           clearPendingApprovalForTerminal(recoveryConvoId);
-          resetLive({ ...currentSubmission, userMessage });
+          resetLive(sub.liveSubmission());
           if (
-            !createdStreamIdsRef.current.has(currentStreamId) &&
-            optimisticStreamIdsRef.current.has(currentStreamId)
+            !run.createdStreamIds.has(currentStreamId) &&
+            run.optimisticStreamIds.has(currentStreamId)
           ) {
             removeConvoFromAllQueries(queryClient, currentStreamId);
           }
@@ -2949,12 +2672,12 @@ export default function useResumableSSE(
           // Display the error to user via errorHandler
           errorHandler({
             data: { text: errorString } as unknown as Parameters<typeof errorHandler>[0]['data'],
-            submission: currentSubmission as EventSubmission,
+            submission: sub.submission as EventSubmission,
           });
 
           setIsSubmitting(false);
           setShowStopButton(false);
-          const recoverySteerId = getRecoverySteerId(currentSubmission);
+          const recoverySteerId = getRecoverySteerId(sub.submission);
           if (
             recoverySteerId != null &&
             generationProtocolVersion === GENERATION_PROTOCOL_VERSION &&
@@ -2966,7 +2689,7 @@ export default function useResumableSSE(
                * started before this recovery could return a stale parked copy
                * after a successful commit and must never authorize redelivery. */
               const terminalStatus = await fetchStreamStatus(recoveryConvoId);
-              if (!isCurrentSubscription()) {
+              if (!sub.isCurrent()) {
                 return;
               }
               const releasedSource = terminalStatus.unrecoveredSteers?.find(
@@ -2983,7 +2706,7 @@ export default function useResumableSSE(
                 });
               }
             } catch (error) {
-              if (!isCurrentSubscription()) {
+              if (!sub.isCurrent()) {
                 return;
               }
               logger.warn('ResumableSSE', 'Could not recover source after generation error', {
@@ -3003,13 +2726,12 @@ export default function useResumableSSE(
           setRunEnd({
             conversationId: recoveryConvoId,
             outcome: 'error',
-            endedAt: Date.now(),
+            endedAt: run.scheduler.now(),
             generationCreatedAt,
           });
           setStreamId(null);
-          optimisticStreamIdsRef.current.delete(currentStreamId);
-          createdStreamIdsRef.current.delete(currentStreamId);
-          reconnectAttemptRef.current = 0;
+          run.releaseStream(currentStreamId);
+          run.reconnectAttempt = 0;
           return;
         }
 
@@ -3019,31 +2741,19 @@ export default function useResumableSSE(
           hasData: data != null,
         });
 
-        if (reconnectAttemptRef.current < MAX_RETRIES) {
+        if (run.reconnectAttempt < MAX_RETRIES) {
           // Increment counter BEFORE close() so abort handler knows we're reconnecting
-          reconnectAttemptRef.current++;
-          const delay = getReconnectDelay(reconnectAttemptRef.current);
+          run.reconnectAttempt++;
+          const delay = getReconnectDelay(run.reconnectAttempt);
 
           logger.log(
             'ResumableSSE',
-            `Reconnecting in ${delay}ms (attempt ${reconnectAttemptRef.current}/${MAX_RETRIES})`,
+            `Reconnecting in ${delay}ms (attempt ${run.reconnectAttempt}/${MAX_RETRIES})`,
           );
 
-          closeStream();
+          sub.close();
 
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (isCurrentSubscription() && submissionRef.current) {
-              // Reconnect with isResume=true to get sync event with any missed content
-              subscribeToStream(
-                currentStreamId,
-                submissionRef.current,
-                true,
-                generationCreatedAt,
-                generationProtocolVersion,
-                lifecycleSignal,
-              );
-            }
-          }, delay);
+          sub.scheduleReattach(delay);
 
           // Keep UI in "submitting" state during reconnection attempts
           // so user knows we're still trying (abort handler may have reset these)
@@ -3051,17 +2761,17 @@ export default function useResumableSSE(
           setShowStopButton(generationCreatedAt != null);
         } else {
           logger.error('ResumableSSE', 'Max reconnect attempts reached');
-          closeStream();
+          sub.close();
           flushPendingDeltas();
-          const recoveryConvoId = currentSubmission.conversation?.conversationId ?? currentStreamId;
+          const recoveryConvoId = sub.submission.conversation?.conversationId ?? currentStreamId;
           let status: Awaited<ReturnType<typeof fetchStreamStatus>> | undefined;
           try {
             status = await fetchStreamStatus(recoveryConvoId);
-            if (!isCurrentSubscription()) {
+            if (!sub.isCurrent()) {
               return;
             }
           } catch (error) {
-            if (!isCurrentSubscription()) {
+            if (!sub.isCurrent()) {
               return;
             }
             logger.warn('ResumableSSE', 'Could not determine job state after reconnect limit', {
@@ -3085,25 +2795,14 @@ export default function useResumableSSE(
             (generationCreatedAt == null || status.createdAt !== generationCreatedAt)
           ) {
             const handedOff = await handoffToReplacement(recoveryConvoId, status);
-            if (!isCurrentSubscription()) {
+            if (!sub.isCurrent()) {
               return;
             }
             if (handedOff) {
               return;
             }
-            reconnectAttemptRef.current = 0;
-            reconnectTimeoutRef.current = setTimeout(() => {
-              if (isCurrentSubscription() && submissionRef.current) {
-                subscribeToStream(
-                  currentStreamId,
-                  submissionRef.current,
-                  true,
-                  generationCreatedAt,
-                  generationProtocolVersion,
-                  lifecycleSignal,
-                );
-              }
-            }, 30_000);
+            run.reconnectAttempt = 0;
+            sub.scheduleReattach(30_000);
             return;
           }
 
@@ -3129,19 +2828,8 @@ export default function useResumableSSE(
             }
             setIsSubmitting(true);
             setShowStopButton(generationCreatedAt != null);
-            reconnectAttemptRef.current = 0;
-            reconnectTimeoutRef.current = setTimeout(() => {
-              if (isCurrentSubscription() && submissionRef.current) {
-                subscribeToStream(
-                  currentStreamId,
-                  submissionRef.current,
-                  true,
-                  generationCreatedAt,
-                  generationProtocolVersion,
-                  lifecycleSignal,
-                );
-              }
-            }, 30_000);
+            run.reconnectAttempt = 0;
+            sub.scheduleReattach(30_000);
             return;
           }
 
@@ -3152,25 +2840,14 @@ export default function useResumableSSE(
             queryClient.invalidateQueries({ queryKey: streamStatusQueryKey(recoveryConvoId) });
             setIsSubmitting(true);
             setShowStopButton(generationCreatedAt != null);
-            reconnectAttemptRef.current = 0;
-            reconnectTimeoutRef.current = setTimeout(() => {
-              if (isCurrentSubscription() && submissionRef.current) {
-                subscribeToStream(
-                  currentStreamId,
-                  submissionRef.current,
-                  true,
-                  generationCreatedAt,
-                  generationProtocolVersion,
-                  lifecycleSignal,
-                );
-              }
-            }, 30_000);
+            run.reconnectAttempt = 0;
+            sub.scheduleReattach(30_000);
             return;
           }
 
           // The status endpoint proved the job terminal. Reconcile persisted
           // content before recovering leftovers, just like the 404 path.
-          cancelSteerRetryFrames();
+          run.cancelSteerRetryFrames();
           let persistedMessages: TMessage[] | undefined;
           try {
             const messageQueryKey = [QueryKeys.messages, recoveryConvoId] as const;
@@ -3178,20 +2855,20 @@ export default function useResumableSSE(
               queryKey: messageQueryKey,
               refetchType: 'none',
             });
-            if (!isCurrentSubscription()) {
+            if (!sub.isCurrent()) {
               return;
             }
             const fetched = await queryClient.fetchQuery<TMessage[]>({
               queryKey: messageQueryKey,
             });
-            if (!isCurrentSubscription()) {
+            if (!sub.isCurrent()) {
               return;
             }
             if (Array.isArray(fetched)) {
               persistedMessages = fetched;
             }
           } catch (error) {
-            if (!isCurrentSubscription()) {
+            if (!sub.isCurrent()) {
               return;
             }
             logger.warn('ResumableSSE', 'Could not reconcile terminal messages after disconnect', {
@@ -3212,7 +2889,7 @@ export default function useResumableSSE(
           const canRecoverTerminalSteers = generationProtocolVersion === 1 || confirmedV2Terminal;
           const unrecovered = canRecoverTerminalSteers ? (status.unrecoveredSteers ?? []) : [];
           if (unrecovered.length > 0) {
-            const recoverySteerId = getRecoverySteerId(currentSubmission);
+            const recoverySteerId = getRecoverySteerId(sub.submission);
             convertSteersToQueued(recoveryConvoId, unrecovered, {
               generationProtocolVersion,
               ...(recoverySteerId != null && {
@@ -3233,17 +2910,17 @@ export default function useResumableSSE(
             });
           }
 
-          resetLive({ ...currentSubmission, userMessage });
+          resetLive(sub.liveSubmission());
           removeActiveJob(currentStreamId);
           clearAttachedGenerationCreatedAt();
           clearPendingApprovalForTerminal(recoveryConvoId);
           if (
-            !createdStreamIdsRef.current.has(currentStreamId) &&
-            optimisticStreamIdsRef.current.has(currentStreamId)
+            !run.createdStreamIds.has(currentStreamId) &&
+            run.optimisticStreamIds.has(currentStreamId)
           ) {
             removeConvoFromAllQueries(queryClient, currentStreamId);
           }
-          subscriptionRetired = true;
+          sub.retired = true;
           setIsSubmitting(false);
           setShowStopButton(false);
           let recoveryOutcome: 'completed' | 'aborted' | 'error' = 'error';
@@ -3256,15 +2933,15 @@ export default function useResumableSSE(
             recoveryOutcome === 'completed'
               ? completedResponseMessageId(
                   persistedMessages,
-                  userMessage?.messageId,
+                  sub.userMessage?.messageId,
                   status?.resumeState?.responseMessageId ??
-                    currentSubmission.initialResponse?.messageId,
+                    sub.submission.initialResponse?.messageId,
                 )
               : undefined;
           setRunEnd({
             conversationId: recoveryConvoId,
             outcome: recoveryOutcome,
-            endedAt: Date.now(),
+            endedAt: run.scheduler.now(),
             generationCreatedAt: status.createdAt ?? generationCreatedAt,
             ...(recoveredResponseMessageId != null && {
               responseMessageId: recoveredResponseMessageId,
@@ -3272,9 +2949,8 @@ export default function useResumableSSE(
           });
           setSubmission(null);
           setStreamId(null);
-          optimisticStreamIdsRef.current.delete(currentStreamId);
-          createdStreamIdsRef.current.delete(currentStreamId);
-          reconnectAttemptRef.current = 0;
+          run.releaseStream(currentStreamId);
+          run.reconnectAttempt = 0;
         }
       };
 
@@ -3286,28 +2962,25 @@ export default function useResumableSSE(
        * connection rather than stranding the pane on its partial content.
        */
       const handleClose = () => {
-        if (!isCurrentSubscription()) {
+        if (!sub.isCurrent()) {
           return;
         }
 
-        if (replacementHandoffRef.current) {
+        if (run.replacementHandoff) {
           logger.log('ResumableSSE', 'Stream closed for generation handoff - preserving state');
           return;
         }
         // If we're in a reconnection cycle, don't reset state
         // (error handler will set up the reconnect timeout)
-        if (reconnectAttemptRef.current > 0) {
+        if (run.reconnectAttempt > 0) {
           logger.log('ResumableSSE', 'Stream closed for reconnect - preserving state');
           return;
         }
 
         logger.log('ResumableSSE', 'Stream aborted (intentional close) - no reconnect');
-        cancelSteerRetryFrames();
+        run.cancelSteerRetryFrames();
         // Clear any pending reconnect attempts
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = null;
-        }
+        run.clearReconnectTimeout();
         // Reset UI state - useResumeOnLoad will restore if user returns to this conversation
         setIsSubmitting(false);
         setShowStopButton(false);
@@ -3316,7 +2989,7 @@ export default function useResumableSSE(
          *  while generating): discard the in-flight pending usage so it can't
          *  merge into the next response in this conversation. On a resume the
          *  collected usage is re-folded via backfillUsage, so nothing is lost. */
-        resetLive({ ...currentSubmission, userMessage });
+        resetLive(sub.liveSubmission());
         // No final/error event fires on this path, so it's the only place left
         // to sweep a local `failed` chip; otherwise it survives this close and
         // renders (with a live Retry) under whatever run starts next. `pending`
@@ -3325,33 +2998,17 @@ export default function useResumableSSE(
         // server-ACK'd `pending` steer is not stranded: the server injects it
         // regardless, and sweeping it into the queue too would resend the same
         // words as a duplicate turn once `useQueueDrain` fires at run end.
-        convertLocalSteersToQueued(
-          currentSubmission.conversation?.conversationId ?? currentStreamId,
-          { statuses: ABORT_SWEEP_STATUSES },
-        );
+        convertLocalSteersToQueued(sub.submission.conversation?.conversationId ?? currentStreamId, {
+          statuses: ABORT_SWEEP_STATUSES,
+        });
       };
 
-      connection = transport.stream({ token }).reconnectToStream(
-        { url, headers: generationProtocolHeaders() },
-        {
-          signal: streamController.signal,
-          onEvent: (event) => {
-            switch (event.type) {
-              case 'open':
-                handleOpen();
-                return;
-              case 'error':
-                void handleTransportFailure(event);
-                return;
-              case 'abort':
-                handleClose();
-                return;
-              default:
-                void handleFrame(event);
-            }
-          },
-        },
-      );
+      sub.connect(transport.stream({ token }), {
+        onOpen: handleOpen,
+        onFrame: (event) => void handleFrame(event),
+        onFailure: (event) => void handleTransportFailure(event),
+        onClose: handleClose,
+      });
 
       // Debug hooks for testing reconnection vs clean close behavior (dev only)
       if (import.meta.env.DEV) {
@@ -3369,12 +3026,13 @@ export default function useResumableSSE(
         /** Simulate clean close (navigation away) - triggers abort event → no reconnection */
         debugWindow.__closeClean = () => {
           logger.log('Debug', 'Simulating clean close (navigation away)...');
-          subscriptionRetired = true;
-          closeStream();
+          sub.retired = true;
+          sub.close();
         };
       }
     },
     [
+      run,
       isAddedRequest,
       setConversation,
       runIndex,
@@ -3451,7 +3109,7 @@ export default function useResumableSSE(
       let requestAttempts = 0;
       let networkAttempts = 0;
       let readinessAttempts = 0;
-      const readinessDeadline = Date.now() + START_GENERATION_READINESS_TIMEOUT_MS;
+      const readinessDeadline = run.scheduler.now() + START_GENERATION_READINESS_TIMEOUT_MS;
 
       while (!signal?.aborted) {
         const recoverySteerId = getRecoverySteerId(currentSubmission);
@@ -3559,7 +3217,7 @@ export default function useResumableSSE(
           lastError = error;
           const isNetworkError = isRetryableNetworkError(error);
           const isServerNotReady = isServerNotReadyError(error);
-          const remainingReadinessMs = readinessDeadline - Date.now();
+          const remainingReadinessMs = readinessDeadline - run.scheduler.now();
           const shouldRetryNetwork =
             isNetworkError && networkAttempts < START_GENERATION_NETWORK_RETRIES - 1;
           const shouldRetryServerNotReady = isServerNotReady && remainingReadinessMs > 0;
@@ -3669,6 +3327,7 @@ export default function useResumableSSE(
       return null;
     },
     [
+      run,
       clearStepMaps,
       convertSteersToQueued,
       errorHandler,
@@ -3687,18 +3346,15 @@ export default function useResumableSSE(
     if (!submission || Object.keys(submission).length === 0) {
       logger.log('ResumableSSE', 'No submission, cleaning up');
       // Clear reconnect timeout if submission is cleared
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = null;
-      }
-      stopForegroundReattachRef.current?.();
-      stopForegroundReattachRef.current = null;
+      run.clearReconnectTimeout();
+      run.stopForegroundReattach?.();
+      run.stopForegroundReattach = null;
       // Close SSE but do NOT dispatch cancel - navigation should not abort
-      streamRef.current?.abort();
-      streamRef.current = null;
+      run.stream?.abort();
+      run.stream = null;
       setStreamId(null);
-      reconnectAttemptRef.current = 0;
-      submissionRef.current = null;
+      run.reconnectAttempt = 0;
+      run.submission = null;
       return;
     }
 
@@ -3718,10 +3374,10 @@ export default function useResumableSSE(
       userMessageId: submission.userMessage?.messageId,
     });
 
-    submissionRef.current = submission;
-    runEndPublishedRef.current = false;
-    identityConfirmedRef.current = false;
-    subscribedEpochRef.current = null;
+    run.submission = submission;
+    run.runEndPublished = false;
+    run.identityConfirmed = false;
+    run.subscribedEpoch = null;
     if (submission.conversation?.conversationId != null) {
       /** A different run starting here owns the conversation's end from now on: an earlier run
        *  this pane left is superseded, and a Stop belonged to that earlier run. Reattaching to
@@ -3744,7 +3400,7 @@ export default function useResumableSSE(
     }
     const startController = new AbortController();
     const { signal } = startController;
-    const isCurrentEffect = () => !signal.aborted && submissionRef.current === submission;
+    const isCurrentEffect = () => !signal.aborted && run.submission === submission;
 
     const initStream = async () => {
       if (!isCurrentEffect()) {
@@ -3774,14 +3430,14 @@ export default function useResumableSSE(
         setStreamId(resumeStreamId);
         // Optimistically add to active jobs (in case it's not already there)
         addActiveJob(resumeStreamId);
-        subscribeToStream(
-          resumeStreamId,
+        subscribeToStream({
+          streamId: resumeStreamId,
           submission,
-          true,
-          resumeGenerationCreatedAt,
-          resumeGenerationProtocolVersion,
+          isResume: true,
+          generationCreatedAt: resumeGenerationCreatedAt,
+          generationProtocolVersion: resumeGenerationProtocolVersion,
           signal,
-        );
+        });
       } else {
         // New generation: start and then subscribe
         logger.log('ResumableSSE', 'Starting NEW generation');
@@ -3908,7 +3564,7 @@ export default function useResumableSSE(
                 });
               }
               clearDrainAfterAbort(startResult.conversationId, expectedPredecessorCreatedAt);
-              submissionRef.current = null;
+              run.submission = null;
               setIsSubmitting(false);
               setShowStopButton(false);
               setSubmission(null);
@@ -4005,7 +3661,7 @@ export default function useResumableSSE(
               );
               addActiveJob(replacementStart.streamId);
               if (startedAsNewConvo) {
-                optimisticStreamIdsRef.current.add(replacementStart.streamId);
+                run.optimisticStreamIds.add(replacementStart.streamId);
                 updateActiveGenerationCreatedAt(
                   Constants.NEW_CONVO,
                   replacementStart.generationCreatedAt,
@@ -4025,8 +3681,8 @@ export default function useResumableSSE(
                 replacementStatus.resumeState?.aggregatedContent ??
                   replacementStatus.aggregatedContent,
               );
-              replacementHandoffRef.current = true;
-              submissionRef.current = null;
+              run.replacementHandoff = true;
+              run.submission = null;
               setIsSubmitting(true);
               setShowStopButton(true);
               setSubmission(null);
@@ -4052,7 +3708,7 @@ export default function useResumableSSE(
             setRunEnd({
               conversationId: replacementStart.conversationId,
               outcome: 'error',
-              endedAt: Date.now(),
+              endedAt: run.scheduler.now(),
               generationCreatedAt: replacementStart.generationCreatedAt,
             });
             setSubmission(null);
@@ -4184,7 +3840,7 @@ export default function useResumableSSE(
               conversationId: settledConversationId,
               outcome: conversationLookup === 'inconclusive' ? 'error' : 'aborted',
               startedAsNewConvo,
-              endedAt: Date.now(),
+              endedAt: run.scheduler.now(),
             });
             setSubmission(null);
             return;
@@ -4209,21 +3865,21 @@ export default function useResumableSSE(
             queueTitleGeneration(newStreamId);
           }
           if (isInitialNewConversation(submission)) {
-            optimisticStreamIdsRef.current.add(newStreamId);
+            run.optimisticStreamIds.add(newStreamId);
             replaceNewConversationUrl(newStreamId);
           }
           const streamSubmission = addOptimisticConversation(newStreamId, submission);
-          submissionRef.current = streamSubmission;
+          run.submission = streamSubmission;
           // A deduped retry (status: 'resumed') attaches to an already-running stream, so
           // subscribe with resume=true to replay its state instead of only live events.
-          subscribeToStream(
-            newStreamId,
-            streamSubmission,
-            resumed,
+          subscribeToStream({
+            streamId: newStreamId,
+            submission: streamSubmission,
+            isResume: resumed,
             generationCreatedAt,
             generationProtocolVersion,
             signal,
-          );
+          });
         } else {
           logger.error('ResumableSSE', 'Failed to get streamId from startGeneration');
         }
@@ -4240,51 +3896,32 @@ export default function useResumableSSE(
       setSubmission(null);
     });
 
-    /** The Set object itself is never reassigned, so this alias reads the
-     *  LIVE frame ids at cleanup time (satisfies react-hooks/exhaustive-deps
-     *  without changing behavior). */
-    const activityLabelRetryFrames = activityLabelRetryFramesRef.current;
-    const steerRetryFrames = steerRetryFramesRef.current;
     return () => {
       logger.log('ResumableSSE', 'Cleanup - closing SSE, resetting UI state');
       startController.abort();
       // Cleanup on unmount/navigation - close connection but DO NOT abort backend
       // Reset UI state so it doesn't leak to other conversations
       // If user returns to this conversation, useResumeOnLoad will restore the state
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = null;
-      }
-      if (pendingActionRetryRef.current != null) {
-        cancelAnimationFrame(pendingActionRetryRef.current);
-        pendingActionRetryRef.current = null;
-      }
-      for (const frameId of activityLabelRetryFrames) {
-        cancelAnimationFrame(frameId);
-      }
-      activityLabelRetryFrames.clear();
-      for (const frameId of steerRetryFrames) {
-        cancelAnimationFrame(frameId);
-      }
-      steerRetryFrames.clear();
-      stopForegroundReattachRef.current?.();
-      stopForegroundReattachRef.current = null;
+      run.clearReconnectTimeout();
+      run.cancelRetryFrames();
+      run.stopForegroundReattach?.();
+      run.stopForegroundReattach = null;
       // Reset reconnect counter before closing (so abort handler doesn't think we're reconnecting)
-      reconnectAttemptRef.current = 0;
+      run.reconnectAttempt = 0;
       /** The pane is moving off a run that is still generating (another chat, a new chat, or
        *  an unmount): the server keeps going with no subscriber and deletes the job when done,
        *  so no terminal event will reach the queue drain. Remember the run; on return its end is
        *  read from history. Only a run whose identity the server confirmed (its epoch, and the
        *  user message `created` or a resume's sync named) is remembered, and not a regeneration,
        *  a run that already published its end, or one the user stopped. */
-      const closing = submissionRef.current;
+      const closing = run.submission;
       const closingConvoId = closing?.conversation?.conversationId;
       const closingUserMessageId = closing?.userMessage?.messageId;
-      const generationCreatedAt = subscribedEpochRef.current;
+      const generationCreatedAt = run.subscribedEpoch;
       if (
-        streamRef.current != null &&
-        identityConfirmedRef.current &&
-        !runEndPublishedRef.current &&
+        run.stream != null &&
+        run.identityConfirmed &&
+        !run.runEndPublished &&
         closing?.isRegenerate !== true &&
         closingConvoId != null &&
         closingConvoId !== Constants.NEW_CONVO &&
@@ -4298,18 +3935,18 @@ export default function useResumableSSE(
           generationCreatedAt,
         });
       }
-      streamRef.current?.abort();
-      streamRef.current = null;
+      run.stream?.abort();
+      run.stream = null;
       // Clear handler maps to prevent memory leaks and stale state
       clearStepMaps();
       // Reset UI state on ordinary cleanup. A generation handoff already
       // cached the replacement and must remain non-idle until resume-on-load
       // installs its epoch-fenced submission.
-      if (!replacementHandoffRef.current) {
+      if (!run.replacementHandoff) {
         setIsSubmitting(false);
         setShowStopButton(false);
       }
-      replacementHandoffRef.current = false;
+      run.replacementHandoff = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [submission]);
