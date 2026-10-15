@@ -3,6 +3,11 @@ import type { DeleteSkillResult, ISkillFile } from '@librechat/data-schemas';
 import type { Response } from 'express';
 import type { SkillsHandlersDeps } from './handlers';
 import type { ServerRequest } from '~/types';
+import {
+  createOwnedBlobFileDeleter,
+  extractAzureBlobPath,
+  extractFirebaseBlobPath,
+} from '~/storage/ownedBlobDelete';
 import { createSkillsHandlers } from './handlers';
 
 function mockResponse(): Response {
@@ -109,6 +114,65 @@ describe('skill delete handler', () => {
   });
 });
 
+describe.each([
+  {
+    source: 'azure_blob',
+    filepath: 'https://example.blob.core.windows.net/files/uploads/author-1/file.txt',
+    extractPath: (url: string) => extractAzureBlobPath(url, 'files'),
+  },
+  {
+    source: 'firebase',
+    filepath: 'https://firebasestorage.googleapis.com/v0/b/bucket/o/uploads%2Fauthor-1%2Ffile.txt',
+    extractPath: extractFirebaseBlobPath,
+  },
+])(
+  'cross-author Skill file deletion through $source storage',
+  ({ source, filepath, extractPath }) => {
+    it('deletes with the persisted author while the manager remains the requester', async () => {
+      const skillId = new Types.ObjectId().toString();
+      const file = {
+        file_id: 'file-1',
+        filepath,
+        source,
+        author: new Types.ObjectId(),
+        relativePath: 'references/file.txt',
+      } as ISkillFile & { _id: Types.ObjectId };
+      const ownerId = file.author.toString();
+      const ownedFilepath = filepath.replace('author-1', ownerId);
+      file.filepath = ownedFilepath;
+      const deleteBlob = jest.fn().mockResolvedValue(undefined);
+      const deleteRagFile = jest.fn().mockResolvedValue(undefined);
+      const storageDelete = createOwnedBlobFileDeleter({
+        extractPath,
+        deleteBlob,
+        deleteRagFile,
+        isMissing: () => false,
+      });
+      const deleteSkillFile = jest.fn().mockResolvedValue({ deleted: true });
+      const handlers = createSkillsHandlers({
+        getSkillFileByPath: jest.fn().mockResolvedValue(file),
+        getStrategyFunctions: jest.fn(() => ({ deleteFile: storageDelete })),
+        deleteSkillFile,
+      } as unknown as SkillsHandlersDeps);
+      const req = {
+        params: { id: skillId, relativePath: 'references/file.txt' },
+        user: { id: 'manager-1' },
+      } as unknown as ServerRequest;
+      const res = mockResponse();
+
+      await handlers.deleteFile(req, res);
+
+      expect(deleteBlob).toHaveBeenCalledWith(`uploads/${ownerId}/file.txt`);
+      expect(deleteRagFile).toHaveBeenCalledWith({
+        userId: ownerId,
+        file: expect.objectContaining({ user: ownerId }),
+      });
+      expect(deleteSkillFile).toHaveBeenCalledWith(skillId, 'references/file.txt', 'file-1');
+      expect(res.status).toHaveBeenCalledWith(200);
+    });
+  },
+);
+
 describe('skill create handler', () => {
   it('retries dependent cleanup after owner permission setup fails', async () => {
     const skillId = new Types.ObjectId();
@@ -146,5 +210,79 @@ describe('skill create handler', () => {
 
     expect(deleteSkill).toHaveBeenCalledTimes(2);
     expect(res.status).toHaveBeenCalledWith(500);
+  });
+});
+
+describe('skill file delete handler', () => {
+  const id = new Types.ObjectId().toString();
+  const file = {
+    _id: new Types.ObjectId(),
+    file_id: 'file-revision',
+    relativePath: 'references/guide.md',
+    filepath: '/uploads/guide.md',
+    source: 'local',
+    author: new Types.ObjectId(),
+    tenantId: 'tenant-1',
+  } as ISkillFile & { _id: Types.ObjectId };
+  const req = {
+    params: { id, relativePath: 'references/guide.md' },
+  } as unknown as ServerRequest;
+
+  it('waits for blob cleanup before conditionally deleting the file record', async () => {
+    let releaseBlob!: () => void;
+    const deleteBlob = jest.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseBlob = resolve;
+        }),
+    );
+    const deleteSkillFile = jest.fn(async () => ({ deleted: true }));
+    const handlers = createSkillsHandlers({
+      getSkillFileByPath: jest.fn(async () => file),
+      deleteSkillFile,
+      getStrategyFunctions: jest.fn(() => ({ deleteFile: deleteBlob })),
+    } as unknown as SkillsHandlersDeps);
+    const res = mockResponse();
+
+    const pending = handlers.deleteFile(req, res);
+    await Promise.resolve();
+    expect(deleteSkillFile).not.toHaveBeenCalled();
+    releaseBlob();
+    await pending;
+
+    expect(deleteSkillFile).toHaveBeenCalledWith(id, 'references/guide.md', 'file-revision');
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  it('keeps the file record retryable when blob cleanup fails', async () => {
+    const deleteSkillFile = jest.fn();
+    const handlers = createSkillsHandlers({
+      getSkillFileByPath: jest.fn(async () => file),
+      deleteSkillFile,
+      getStrategyFunctions: jest.fn(() => ({
+        deleteFile: jest.fn(async () => {
+          throw new Error('storage unavailable');
+        }),
+      })),
+    } as unknown as SkillsHandlersDeps);
+    const res = mockResponse();
+
+    await handlers.deleteFile(req, res);
+
+    expect(deleteSkillFile).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(500);
+  });
+
+  it('reports a conflict when a concurrent writer replaces the path', async () => {
+    const handlers = createSkillsHandlers({
+      getSkillFileByPath: jest.fn(async () => file),
+      deleteSkillFile: jest.fn(async () => ({ deleted: false })),
+      getStrategyFunctions: jest.fn(() => ({ deleteFile: jest.fn(async () => undefined) })),
+    } as unknown as SkillsHandlersDeps);
+    const res = mockResponse();
+
+    await handlers.deleteFile(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
   });
 });
