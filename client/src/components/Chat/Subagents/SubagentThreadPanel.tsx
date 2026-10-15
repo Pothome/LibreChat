@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { v4 } from 'uuid';
-import { useAtom, useSetAtom, useStore } from 'jotai';
-import { Clock, OctagonPause, X, Zap } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { dataService, ForkOptions } from 'librechat-data-provider';
+import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai';
+import { ArrowUpRight, Clock, OctagonPause, X, Zap } from 'lucide-react';
 import {
   Alert,
   Button,
@@ -38,6 +39,14 @@ import {
   retainBoundedMovingWindowTurns,
 } from './adapters';
 import {
+  activeSubagentPanel,
+  subagentPanelFocusRequest,
+  subagentControlStateByTask,
+  subagentControlStateKey,
+  subagentProgressKey,
+  useSubagentProgress,
+} from './state';
+import {
   agentAuthor,
   resolveSubagentAuthor,
   isSelfSpawn as isSelfSpawnType,
@@ -45,13 +54,6 @@ import {
   readableSubagentType,
   useParentAuthor,
 } from './author';
-import {
-  activeSubagentPanel,
-  subagentControlStateByTask,
-  subagentControlStateKey,
-  subagentProgressKey,
-  useSubagentProgress,
-} from './state';
 import useSubagentActivityStream from '~/data-provider/Subagents/useSubagentActivityStream';
 import SubagentActivity, { SubagentActivityScrollSurface } from './SubagentActivity';
 import ApprovalProvider from '~/components/Chat/Messages/Content/ApprovalContext';
@@ -127,9 +129,16 @@ export default function SubagentThreadPanel({ selection }: { selection: ActiveSu
   const clearsFooter = useConfiguredFooter();
   const localize = useLocalize();
   const panelStore = useStore();
+  const focusRequest = useAtomValue(subagentPanelFocusRequest);
   const { showToast } = useToastContext();
   const { navigateToConvo } = useNavigateToConvo();
+  const navigate = useNavigate();
   const panelRef = useRef<HTMLDivElement>(null);
+  const returnFocusRef = useRef(
+    document.activeElement instanceof HTMLElement && document.activeElement !== document.body
+      ? document.activeElement
+      : null,
+  );
   const isMobile = useScaledMaxWidth(ARTIFACTS_SHEET_MAX_WIDTH);
   /** Two reasons the send control's action list cannot be used where it hangs.
    *  Without hover, a tap on its anchor submits instead of opening it. And
@@ -775,15 +784,28 @@ export default function SubagentThreadPanel({ selection }: { selection: ActiveSu
   const close = useCallback(() => {
     resetSelection();
     requestAnimationFrame(() => {
+      const available = (element: HTMLElement | null | undefined) =>
+        element != null &&
+        element.isConnected &&
+        !element.matches(':disabled, [aria-disabled="true"]') &&
+        element.closest('[hidden], [inert], [aria-hidden="true"]') == null;
       const trigger = Array.from(
         document.querySelectorAll<HTMLElement>('[data-subagent-tool-call]'),
       ).find(
         (element) =>
           element.dataset.subagentToolCall === selection.toolCallId &&
           element.dataset.subagentParentMessage === selection.parentMessageId &&
-          element.dataset.subagentPartIndex === String(selection.partIndex),
+          element.dataset.subagentPartIndex === String(selection.partIndex) &&
+          available(element),
       );
-      trigger?.focus();
+      const disclosure = document.querySelector<HTMLElement>(
+        '[data-testid="header-background-tasks-button"]',
+      );
+      const destination =
+        trigger ??
+        (available(returnFocusRef.current) ? returnFocusRef.current : null) ??
+        (available(disclosure) ? disclosure : null);
+      destination?.focus({ preventScroll: true });
     });
   }, [resetSelection, selection.parentMessageId, selection.partIndex, selection.toolCallId]);
 
@@ -793,6 +815,9 @@ export default function SubagentThreadPanel({ selection }: { selection: ActiveSu
    *  nested popover that meant to dismiss only itself. As a React handler it
    *  bubbles in DOM order, so an inner control can stop it or mark it handled. */
   useFocusTrap(panelRef, isMobile);
+  useEffect(() => {
+    if (!isMobile) panelRef.current?.focus({ preventScroll: true });
+  }, [focusRequest, isMobile]);
   const handlePanelKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLElement>) => {
       if (!isMobile || event.key !== 'Escape' || event.defaultPrevented) return;
@@ -1528,6 +1553,7 @@ export default function SubagentThreadPanel({ selection }: { selection: ActiveSu
   return (
     <aside
       ref={panelRef}
+      tabIndex={-1}
       role={isMobile ? 'dialog' : 'region'}
       aria-modal={isMobile || undefined}
       aria-label={localize('com_ui_subagent_thread_panel')}
@@ -1587,6 +1613,17 @@ export default function SubagentThreadPanel({ selection }: { selection: ActiveSu
             </h2>
           </>
         )}
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          onClick={() => navigate(`/c/${encodeURIComponent(selection.parentConversationId)}`)}
+          aria-label={localize('com_ui_subagent_go_to_parent')}
+          title={localize('com_ui_subagent_go_to_parent')}
+          className="h-8 w-8 shrink-0"
+        >
+          <ArrowUpRight className="size-[1.0625rem]" aria-hidden="true" />
+        </Button>
         <Button
           type="button"
           variant="ghost"
