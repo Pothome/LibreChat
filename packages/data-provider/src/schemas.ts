@@ -1789,6 +1789,11 @@ export const anthropicSchema = anthropicBaseSchema
   .transform((obj) => removeNullishValues(obj))
   .catch(() => ({}));
 
+/** Semantic color variants a banner can use; each maps to the theme's status color roles. */
+export const BANNER_VARIANTS = ['info', 'success', 'warning', 'error', 'neutral'] as const;
+
+export type BannerVariant = (typeof BANNER_VARIANTS)[number];
+
 export const tBannerSchema = z.object({
   bannerId: z.string(),
   message: z.string(),
@@ -1797,6 +1802,7 @@ export const tBannerSchema = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   isPublic: z.boolean(),
+  variant: z.enum(BANNER_VARIANTS).optional(),
   persistable: z.boolean().default(false),
 });
 export type TBanner = z.infer<typeof tBannerSchema>;
