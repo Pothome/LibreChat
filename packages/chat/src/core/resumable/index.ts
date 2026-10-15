@@ -7,3 +7,5 @@ export * from './protocol';
 export * from './run';
 export * from './host';
 export * from './subscription';
+export * from './terminal';
+export * from './reconcile';
