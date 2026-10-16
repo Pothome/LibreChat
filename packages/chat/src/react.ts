@@ -62,3 +62,5 @@ export {
   showStopButtonByIndex,
   abortScrollFamily,
 } from './react/generation';
+export { presetFamily, optionSettingsFamily } from './react/pane';
+export type { PaneOptionSettings } from './react/pane';

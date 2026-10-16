@@ -1,9 +1,11 @@
 import { useStore } from 'jotai';
 import { useRecoilCallback } from 'recoil';
 import { Constants } from 'librechat-data-provider';
-import { isSubmittingFamily } from '@librechat/chat/react';
 import {
+  presetFamily,
   abortScrollFamily,
+  isSubmittingFamily,
+  optionSettingsFamily,
   showStopButtonByIndex,
   submissionStartFamily,
 } from '@librechat/chat/react';
@@ -57,13 +59,12 @@ export default function useClearStates() {
           }
 
           reset(store.filesByIndex(key));
-          reset(store.presetByIndex(key));
+          jotaiStore.set(presetFamily(key), null);
           jotaiStore.set(showStopButtonByIndex(key), false);
           jotaiStore.set(abortScrollFamily(key), false);
           jotaiStore.set(submissionStartFamily(key), null);
           jotaiStore.set(isSubmittingFamily(key), false);
-          reset(store.optionSettingsFamily(key));
-          reset(store.showPopoverFamily(key));
+          jotaiStore.set(optionSettingsFamily(key), {});
           reset(store.showMentionPopoverFamily(key));
           reset(store.showPlusPopoverFamily(key));
           reset(store.showPromptsPopoverFamily(key));
