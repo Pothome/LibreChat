@@ -60,8 +60,6 @@ function Harness() {
         ask: () => undefined,
         regenerate: () => undefined,
         setSiblingIdx: () => undefined,
-        showPopover: false,
-        setShowPopover: () => undefined,
         abortScroll: false,
         setAbortScroll: () => undefined,
         preset: null,
